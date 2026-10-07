@@ -7,6 +7,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -15,7 +16,8 @@
 using namespace std;
 
 const int INPUT_SIZE = 784;
-const int WORKER_COUNT = 4;
+const int MAX_BATCH_SIZE = 8;
+const int BATCH_WAIT_MS = 10;
 
 template <typename T>
 vector<T> loadFile(const string& filename, int count) {
@@ -45,18 +47,30 @@ bool recvAll(int socket, void* buffer, size_t bytes) {
     size_t received = 0;
 
     while (received < bytes) {
-        ssize_t n = recv(
-            socket,
-            ptr + received,
-            bytes - received,
-            0
-        );
+        ssize_t n = recv(socket, ptr + received, bytes - received, 0);
 
         if (n <= 0) {
             return false;
         }
 
         received += n;
+    }
+
+    return true;
+}
+
+bool sendAll(int socket, const void* buffer, size_t bytes) {
+    const char* ptr = reinterpret_cast<const char*>(buffer);
+    size_t sent = 0;
+
+    while (sent < bytes) {
+        ssize_t n = send(socket, ptr + sent, bytes - sent, 0);
+
+        if (n <= 0) {
+            return false;
+        }
+
+        sent += n;
     }
 
     return true;
@@ -109,8 +123,7 @@ struct Request {
     array<float, INPUT_SIZE> image;
 };
 
-void workerLoop(
-    int workerId,
+void batcherLoop(
     queue<Request>& requestQueue,
     mutex& queueMutex,
     condition_variable& queueCV,
@@ -120,43 +133,67 @@ void workerLoop(
     const vector<float>& b2
 ) {
     while (true) {
-        Request request;
+        vector<Request> batch;
 
         {
             unique_lock<mutex> lock(queueMutex);
 
-            queueCV.wait(
-                lock,
-                [&requestQueue]() {
-                    return !requestQueue.empty();
-                }
-            );
+            queueCV.wait(lock, [&]() {
+                return !requestQueue.empty();
+            });
 
-            request = move(requestQueue.front());
+            // Take the first request immediately
+            batch.push_back(move(requestQueue.front()));
             requestQueue.pop();
+
+            // Give other nearby requests a short chance to join
+            auto deadline =
+                chrono::steady_clock::now() +
+                chrono::milliseconds(BATCH_WAIT_MS);
+
+            while (batch.size() < MAX_BATCH_SIZE) {
+
+                if (!requestQueue.empty()) {
+                    batch.push_back(move(requestQueue.front()));
+                    requestQueue.pop();
+                    continue;
+                }
+
+                if (queueCV.wait_until(lock, deadline)
+                    == cv_status::timeout) {
+                    break;
+                }
+            }
         }
 
-        int prediction = predict(
-            request.image.data(),
-            W1,
-            b1,
-            W2,
-            b2
-        );
+        vector<int> predictions(batch.size());
 
-        send(
-            request.clientSocket,
-            &prediction,
-            sizeof(prediction),
-            0
-        );
+        // CPU backend for now.
+        // Later this entire batch goes to CUDA together.
+        for (size_t i = 0; i < batch.size(); i++) {
+            predictions[i] = predict(
+                batch[i].image.data(),
+                W1,
+                b1,
+                W2,
+                b2
+            );
+        }
 
-        cout
-            << "Worker " << workerId
-            << " prediction: " << prediction
-            << endl;
+        for (size_t i = 0; i < batch.size(); i++) {
+            sendAll(
+                batch[i].clientSocket,
+                &predictions[i],
+                sizeof(predictions[i])
+            );
 
-        close(request.clientSocket);
+            close(batch[i].clientSocket);
+        }
+
+        cout << "Processed batch of "
+             << batch.size()
+             << " requests"
+             << endl;
     }
 }
 
@@ -179,24 +216,18 @@ int main() {
     mutex queueMutex;
     condition_variable queueCV;
 
-    // Create permanent worker threads
-    vector<thread> workers;
+    thread batcher(
+        batcherLoop,
+        ref(requestQueue),
+        ref(queueMutex),
+        ref(queueCV),
+        cref(W1),
+        cref(b1),
+        cref(W2),
+        cref(b2)
+    );
 
-    for (int i = 0; i < WORKER_COUNT; i++) {
-        workers.emplace_back(
-            workerLoop,
-            i,
-            ref(requestQueue),
-            ref(queueMutex),
-            ref(queueCV),
-            cref(W1),
-            cref(b1),
-            cref(W2),
-            cref(b2)
-        );
-
-        workers.back().detach();
-    }
+    batcher.detach();
 
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -226,11 +257,8 @@ int main() {
 
     listen(serverSocket, 64);
 
-    cout
-        << "GPUServe listening on port 8080 with "
-        << WORKER_COUNT
-        << " worker threads..."
-        << endl;
+    cout << "GPUServe listening on port 8080..." << endl;
+    cout << "Max batch size: " << MAX_BATCH_SIZE << endl;
 
     while (true) {
         int clientSocket = accept(
