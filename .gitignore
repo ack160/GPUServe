@@ -73,3 +73,5 @@ server
 
 sample_image.bin
 mnist.gz
+load_test
+server_gpu
