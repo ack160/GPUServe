@@ -2,6 +2,8 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
+#include <thread>
+
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -18,8 +20,10 @@ vector<T> loadFile(const string& filename, int count) {
         exit(1);
     }
 
-    file.read(reinterpret_cast<char*>(data.data()),
-              count * sizeof(T));
+    file.read(
+        reinterpret_cast<char*>(data.data()),
+        count * sizeof(T)
+    );
 
     if (!file) {
         cerr << "ERROR: Failed reading " << filename << endl;
@@ -34,7 +38,12 @@ bool recvAll(int socket, void* buffer, size_t bytes) {
     size_t received = 0;
 
     while (received < bytes) {
-        ssize_t n = recv(socket, ptr + received, bytes - received, 0);
+        ssize_t n = recv(
+            socket,
+            ptr + received,
+            bytes - received,
+            0
+        );
 
         if (n <= 0) {
             return false;
@@ -88,19 +97,64 @@ int predict(
     return prediction;
 }
 
+void handleClient(
+    int clientSocket,
+    const vector<float>& W1,
+    const vector<float>& b1,
+    const vector<float>& W2,
+    const vector<float>& b2
+) {
+    float image[784];
+
+    if (recvAll(clientSocket, image, sizeof(image))) {
+        int prediction = predict(
+            image,
+            W1,
+            b1,
+            W2,
+            b2
+        );
+
+        send(
+            clientSocket,
+            &prediction,
+            sizeof(prediction),
+            0
+        );
+
+        cout << "Prediction: "
+             << prediction
+             << endl;
+    }
+
+    close(clientSocket);
+}
+
 int main() {
     const int PORT = 8080;
 
-    auto W1 = loadFile<float>("model_data/W1.bin", 128 * 784);
-    auto b1 = loadFile<float>("model_data/b1.bin", 128);
-    auto W2 = loadFile<float>("model_data/W2.bin", 10 * 128);
-    auto b2 = loadFile<float>("model_data/b2.bin", 10);
+    auto W1 =
+        loadFile<float>("model_data/W1.bin", 128 * 784);
+
+    auto b1 =
+        loadFile<float>("model_data/b1.bin", 128);
+
+    auto W2 =
+        loadFile<float>("model_data/W2.bin", 10 * 128);
+
+    auto b2 =
+        loadFile<float>("model_data/b2.bin", 10);
 
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
 
     int opt = 1;
-    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR,
-               &opt, sizeof(opt));
+    setsockopt(
+        serverSocket,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &opt,
+        sizeof(opt)
+    );
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -121,25 +175,25 @@ int main() {
     cout << "GPUServe listening on port 8080..." << endl;
 
     while (true) {
-        int clientSocket = accept(serverSocket, nullptr, nullptr);
+        int clientSocket = accept(
+            serverSocket,
+            nullptr,
+            nullptr
+        );
 
         if (clientSocket < 0) {
             continue;
         }
 
-        float image[784];
+        thread worker(
+            handleClient,
+            clientSocket,
+            cref(W1),
+            cref(b1),
+            cref(W2),
+            cref(b2)
+        );
 
-        if (recvAll(clientSocket, image, sizeof(image))) {
-            int prediction = predict(image, W1, b1, W2, b2);
-
-            send(clientSocket,
-                 &prediction,
-                 sizeof(prediction),
-                 0);
-
-            cout << "Prediction: " << prediction << endl;
-        }
-
-        close(clientSocket);
+        worker.detach();
     }
 }
