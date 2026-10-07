@@ -1,14 +1,21 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
 using namespace std;
+
+const int INPUT_SIZE = 784;
+const int WORKER_COUNT = 4;
 
 template <typename T>
 vector<T> loadFile(const string& filename, int count) {
@@ -97,18 +104,40 @@ int predict(
     return prediction;
 }
 
-void handleClient(
-    int clientSocket,
+struct Request {
+    int clientSocket;
+    array<float, INPUT_SIZE> image;
+};
+
+void workerLoop(
+    int workerId,
+    queue<Request>& requestQueue,
+    mutex& queueMutex,
+    condition_variable& queueCV,
     const vector<float>& W1,
     const vector<float>& b1,
     const vector<float>& W2,
     const vector<float>& b2
 ) {
-    float image[784];
+    while (true) {
+        Request request;
 
-    if (recvAll(clientSocket, image, sizeof(image))) {
+        {
+            unique_lock<mutex> lock(queueMutex);
+
+            queueCV.wait(
+                lock,
+                [&requestQueue]() {
+                    return !requestQueue.empty();
+                }
+            );
+
+            request = move(requestQueue.front());
+            requestQueue.pop();
+        }
+
         int prediction = predict(
-            image,
+            request.image.data(),
             W1,
             b1,
             W2,
@@ -116,18 +145,19 @@ void handleClient(
         );
 
         send(
-            clientSocket,
+            request.clientSocket,
             &prediction,
             sizeof(prediction),
             0
         );
 
-        cout << "Prediction: "
-             << prediction
-             << endl;
-    }
+        cout
+            << "Worker " << workerId
+            << " prediction: " << prediction
+            << endl;
 
-    close(clientSocket);
+        close(request.clientSocket);
+    }
 }
 
 int main() {
@@ -145,9 +175,33 @@ int main() {
     auto b2 =
         loadFile<float>("model_data/b2.bin", 10);
 
+    queue<Request> requestQueue;
+    mutex queueMutex;
+    condition_variable queueCV;
+
+    // Create permanent worker threads
+    vector<thread> workers;
+
+    for (int i = 0; i < WORKER_COUNT; i++) {
+        workers.emplace_back(
+            workerLoop,
+            i,
+            ref(requestQueue),
+            ref(queueMutex),
+            ref(queueCV),
+            cref(W1),
+            cref(b1),
+            cref(W2),
+            cref(b2)
+        );
+
+        workers.back().detach();
+    }
+
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
 
     int opt = 1;
+
     setsockopt(
         serverSocket,
         SOL_SOCKET,
@@ -170,9 +224,13 @@ int main() {
         return 1;
     }
 
-    listen(serverSocket, 16);
+    listen(serverSocket, 64);
 
-    cout << "GPUServe listening on port 8080..." << endl;
+    cout
+        << "GPUServe listening on port 8080 with "
+        << WORKER_COUNT
+        << " worker threads..."
+        << endl;
 
     while (true) {
         int clientSocket = accept(
@@ -185,15 +243,23 @@ int main() {
             continue;
         }
 
-        thread worker(
-            handleClient,
-            clientSocket,
-            cref(W1),
-            cref(b1),
-            cref(W2),
-            cref(b2)
-        );
+        Request request;
+        request.clientSocket = clientSocket;
 
-        worker.detach();
+        if (!recvAll(
+            clientSocket,
+            request.image.data(),
+            INPUT_SIZE * sizeof(float)
+        )) {
+            close(clientSocket);
+            continue;
+        }
+
+        {
+            lock_guard<mutex> lock(queueMutex);
+            requestQueue.push(move(request));
+        }
+
+        queueCV.notify_one();
     }
 }
