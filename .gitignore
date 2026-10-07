@@ -70,3 +70,6 @@ Testing/
 client
 server
 *.o
+
+sample_image.bin
+mnist.gz

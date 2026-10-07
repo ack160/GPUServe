@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -8,8 +9,19 @@ using namespace std;
 int main() {
     const int PORT = 8080;
 
-    // Blank 28x28 image for our first networking test
-    float image[784] = {};
+    float image[784];
+
+    ifstream file("sample_image.bin", ios::binary);
+
+    if (!file) {
+        cerr << "Could not open sample_image.bin" << endl;
+        return 1;
+    }
+
+    file.read(
+        reinterpret_cast<char*>(image),
+        sizeof(image)
+    );
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -32,15 +44,10 @@ int main() {
 
     int prediction;
 
-    recv(sock,
-         &prediction,
-         sizeof(prediction),
-         0);
+    recv(sock, &prediction, sizeof(prediction), 0);
 
-    cout << "Server prediction: "
-         << prediction << endl;
+    cout << "Server prediction: " << prediction << endl;
 
     close(sock);
-
     return 0;
 }
