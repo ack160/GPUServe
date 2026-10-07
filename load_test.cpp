@@ -234,7 +234,10 @@ int main(int argc, char* argv[]) {
         static_cast<size_t>(
             0.95 * (latencies.size() - 1)
         );
-
+size_t p99Index =
+    static_cast<size_t>(
+        0.99 * (latencies.size() - 1)
+    );
     double throughput =
         successfulRequests / totalSeconds;
 
@@ -255,6 +258,8 @@ int main(int argc, char* argv[]) {
          << latencies[p50Index] << " ms" << endl;
     cout << "p95 latency:        "
          << latencies[p95Index] << " ms" << endl;
+cout << "p99 latency:        "
+     << latencies[p99Index] << " ms" << endl;
     cout << "==============================" << endl;
 
     return 0;
