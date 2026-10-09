@@ -75,3 +75,22 @@ sample_image.bin
 mnist.gz
 load_test
 server_gpu
+
+# CUDA server executables
+server_gpu_dual
+server_gpu_dual_fixed
+server_gpu_one_worker
+server_gpu_async
+server_gpu_stream0
+server_gpu_slots
+load_test_verify
+
+# Local source backups
+*_backup.cu
+
+# Downloaded MNIST data
+mnist_labels.gz
+
+# Python cache
+__pycache__/
+*.pyc

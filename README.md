@@ -6,41 +6,36 @@ The project starts from an MNIST classifier trained in PyTorch, exports the lear
 
 ## Architecture
 
-```text
-Clients
-   |
-   | TCP requests
-   v
-+---------------------+
-|   C++ TCP Server    |
-+---------------------+
-          |
-          v
-+---------------------+
-| Thread-Safe Queue   |
-+---------------------+
-          |
-          v
-+---------------------+
-|  Dynamic Batcher    |
-| max batch = 8       |
-| wait <= 10 ms       |
-+---------------------+
-          |
-          +-------------------+
-          |                   |
-          v                   v
-   CPU Backend          CUDA Backend
-   C++ inference        Warp-parallel kernels
-          |                   |
-          +---------+---------+
-                    |
-                    v
+GPUServe uses a multithreaded C++ TCP server with dynamic batching and custom CUDA inference.
+
+    TCP Clients
+         |
+         v
+    Thread-Safe Request Queue
+         |
+         v
+    Dynamic Batch Assembly (max 8)
+         |
+         +----------------------+
+         |                      |
+         v                      v
+    GPU Worker 0           GPU Worker 1
+    Buffer Slot 0          Buffer Slot 1
+    CUDA Stream 0          CUDA Stream 1
+         |                      |
+         +-----------+----------+
+                     |
+              Shared Weights
+                     |
+              CUDA Kernels
+                     |
               Predictions
-                    |
-                    v
-                 Clients
-```
+
+Each worker owns separate GPU buffers, pinned host memory, and a CUDA stream.
+
+A mutex prevents simultaneous batch assembly while allowing separate workers to process batches independently.
+
+GPU execution overlap has not been directly verified.
 
 ## Model
 
@@ -77,17 +72,24 @@ The second layer uses the same approach across the 128 hidden activations to pro
 
 ## Dynamic Batching
 
-Incoming TCP requests are placed into a thread-safe queue.
+Incoming TCP requests enter a thread-safe queue. Batches contain up to 8 requests, with a maximum collection wait of 10 ms.
 
-The batcher:
+Profiling showed approximately 99.9-100% full batches under sustained 32-client load.
 
-- takes the first available request
-- waits up to 10 ms for nearby requests
-- collects up to 8 requests
-- performs inference on the batch
-- returns each prediction to the correct client
+Two worker threads use independent buffer slots and CUDA streams. A batch-assembly mutex prevents competing workers from unnecessarily splitting batches.
 
-At low traffic, the batch wait can slightly increase latency. At higher concurrency, batches fill quickly and the GPU can process requests much more efficiently.
+## Asynchronous CUDA Pipeline
+
+Each worker:
+
+1. Packs images into pinned host memory.
+2. Transfers inputs using cudaMemcpyAsync.
+3. Runs custom warp-parallel CUDA kernels.
+4. Transfers predictions using cudaMemcpyAsync.
+5. Synchronizes its stream before reading results.
+6. Sends each prediction to its corresponding client.
+
+Separate CUDA streams enable independent work submission, but actual GPU execution overlap was not directly established.
 
 ## Benchmark Methodology
 
@@ -111,7 +113,7 @@ TCP connect
 -> close connection
 ```
 
-## Benchmark Results
+## Historical CPU vs GPU Benchmark Results
 
 | Concurrent Clients | CPU Throughput | GPU Throughput | Speedup | CPU Avg Latency | GPU Avg Latency |
 |---:|---:|---:|---:|---:|---:|
@@ -135,6 +137,48 @@ GPU p95: 1.17 ms
 ```
 
 That is approximately a 77% reduction in p95 latency.
+
+## Dual-Worker Validation
+
+Tests were performed on an NVIDIA A40.
+
+### Correctness
+
+- MNIST accuracy: 291/300 images (97.0%).
+- Concurrent consistency: 900/900 predictions matched sequential reference predictions.
+- Zero mismatches across three concurrent test rounds.
+- Large repeated-image load tests completed without request failures.
+
+The 97.0% accuracy applies only to the 300-image sample.
+
+### Performance Comparison
+
+| Configuration | Run 1 | Run 2 | Mean |
+|---|---:|---:|---:|
+| One worker | 43,287 req/s | 38,736 req/s | 41,012 req/s |
+| Two workers | 49,733 req/s | 38,646 req/s | 44,190 req/s |
+
+The dual-worker implementation showed approximately 7.7% higher mean throughput in this limited comparison.
+
+Because results varied substantially, this is not evidence of a statistically reliable speedup.
+
+Peak observed short-run throughput was approximately 59,000 requests/sec. This should not be interpreted as sustained throughput.
+
+Simultaneous GPU execution across CUDA streams was not directly verified.
+
+### Verification
+
+Compile the response-checking tester:
+
+    g++ -O3 -pthread load_test_verify.cpp -o load_test_verify
+
+Check the sample digit under concurrent load:
+
+    ./load_test_verify 32 10000
+
+Check multiple MNIST images against sequential predictions:
+
+    python3 verify_multi.py
 
 ## Build and Run
 

@@ -615,18 +615,10 @@ int main() {
         0
     );
 
-    thread batcher1(
-        batcherLoop,
-        ref(requestQueue),
-        ref(queueMutex),
-        ref(queueCV),
-        ref(gpu),
-        ref(assemblyMutex),
-        1
-    );
+
 
     batcher0.detach();
-    batcher1.detach();
+
 
     int serverSocket =
         socket(AF_INET, SOCK_STREAM, 0);
